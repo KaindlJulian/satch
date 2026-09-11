@@ -1929,10 +1929,14 @@ process_time (void)
 static uint64_t
 maximum_resident_set_size (void)
 {
+#ifdef __wasi__
+  return 0;			// No 'ru_maxrss' in the WASI 'rusage'.
+#else
   struct rusage u;
   if (getrusage (RUSAGE_SELF, &u))
     return 0;
   return ((uint64_t) u.ru_maxrss) << 10;
+#endif
 }
 
 // Current memory used by this process as seen by the system.  This is
