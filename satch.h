@@ -102,6 +102,11 @@ void satch_ascii_proof (struct satch *);
 
 void satch_trace_proof (struct satch *, FILE *);
 
+// Write a solver event protocol log to the given file.  Level '1' is the
+// search events, level '2' adds one 'inspect' event per clause BCP looks at.
+
+void satch_events (struct satch *, FILE *, int level);
+
 /*------------------------------------------------------------------------*/
 
 // Return largest added variable index.

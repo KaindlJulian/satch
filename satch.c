@@ -194,6 +194,7 @@
 
 #include "stack.h"		// Generic stack implementation.
 #include "colors.h"		// Shared code for terminal colors.
+#include "events.h"		// Writer for the solver event protocol.
 
 /*------------------------------------------------------------------------*/
 
@@ -203,7 +204,7 @@
 
 struct clause
 {
-#if defined(LOGGING) || defined(NRADIXSORT)
+#if defined(LOGGING) || defined(NRADIXSORT) || defined(EVENTS)
 
   // From 'solver->statistics.added' needed for stable sorting if radix
   // sorting is disabled ('NRADIXSORT' defined) and of course for logging.
@@ -913,6 +914,9 @@ struct satch
 #endif
   struct int_stack added;	// Added external clause.
   FILE *proof;			// Tracing to this file if non-zero.
+#ifdef EVENTS
+  struct events events;
+#endif
 #ifdef LOGGING
   char format[4][128];		// String buffer for logging.
   unsigned next_format;		// Next buffer for logging.
@@ -1202,6 +1206,322 @@ export_literal (unsigned ilit)
   const int elit = SIGN_BIT (ilit) ? -eidx : eidx;
   return elit;
 }
+
+#ifdef EVENTS
+
+// Hooks for the solver event protocol in 'event_protocol/'.  The writer in
+// 'events.h' knows nothing about the solver, only these functions do.
+
+#if defined(DLIS)
+#define EVENTS_HEURISTIC "dlis"
+#elif defined(NVSIDS)
+#define EVENTS_HEURISTIC "vmtf"
+#elif defined(NVMTF)
+#define EVENTS_HEURISTIC "vsids"
+#else
+#define EVENTS_HEURISTIC (solver->stable ? "vsids" : "vmtf")
+#endif
+
+// Unwinding is hooked at 'backtrack', the one function all of it goes
+// through, so the call sites stash their kind through this macro first.
+
+#define BACKTRACK(SOLVER,LEVEL,KIND,REASON) \
+do { \
+  (SOLVER)->events.kind = (KIND); \
+  (SOLVER)->events.reason = (REASON); \
+  backtrack ((SOLVER), (LEVEL)); \
+} while (0)
+
+static void
+events_clause (struct events *events, struct clause *c)
+{
+  events_char (events, '[');
+  bool first = true;
+  for (all_literals_in_clause (lit, c))
+    {
+      if (!first)
+	events_char (events, ',');
+      first = false;
+      events_number (events, (int) export_literal (lit));
+    }
+  events_char (events, ']');
+}
+
+static void
+events_hook_init (struct satch *solver)
+{
+  struct events *events = &solver->events;
+  if (!events->file)
+    return;
+
+  size_t clauses = 0;
+  for (all_irredundant_clauses (c))
+    if (!c->garbage)
+      clauses++;
+
+  events_open (events, "init");
+  events_key (events, "protocol_version");
+  events_text (events, EVENTS_PROTOCOL_VERSION);
+  events_key (events, "variables");
+  events_number (events, VARIABLES);
+  events_key (events, "clauses");
+  events_number (events, clauses);
+  events_key (events, "variable_ids");
+  events_char (events, '[');
+  for (all_variables (idx))
+    {
+      if (idx)
+	events_char (events, ',');
+      events_number (events, idx + 1);
+    }
+  events_char (events, ']');
+  events_key (events, "clause_list");
+  events_char (events, '[');
+  bool first = true;
+  for (all_irredundant_clauses (c))
+    {
+      if (c->garbage)
+	continue;
+      if (!first)
+	events_char (events, ',');
+      first = false;
+      events_string (events, "{\"id\":");
+      events_number (events, c->id);
+      events_string (events, ",\"literals\":");
+      events_clause (events, c);
+      events_char (events, '}');
+    }
+  events_char (events, ']');
+  events_close (events);
+
+  events->started = true;
+
+  // Units of the input are assigned during parsing, before this event can
+  // fire.  They sit on the shadow trail and are replayed as root
+  // propagations here.
+
+  for (size_t i = 0; i != events->trail_size; i++)
+    {
+      events_open (events, "propagate");
+      events_key (events, "literal");
+      events_number (events, events->trail[i].literal);
+      events_key (events, "level");
+      events_number (events, events->trail[i].level);
+      events_key (events, "reason_clause_id");
+      events_string (events, "null");
+      events_close (events);
+    }
+}
+
+static void
+events_hook_assign (struct satch *solver, unsigned lit, unsigned level,
+		    struct clause *reason, bool decision)
+{
+  struct events *events = &solver->events;
+  if (!events->file)
+    return;
+
+  const int elit = (int) export_literal (lit);
+  events_trail_push (events, elit, level);
+
+  if (!events->started)
+    return;
+
+  events_open (events, decision ? "decide" : "propagate");
+  events_key (events, "literal");
+  events_number (events, elit);
+  events_key (events, "level");
+  events_number (events, level);
+  if (decision)
+    {
+      events_key (events, "heuristic");
+      events_text (events, EVENTS_HEURISTIC);
+    }
+  else
+    {
+      events_key (events, "reason_clause_id");
+      if (reason)
+	events_number (events, reason->id);
+      else
+	events_string (events, "null");
+    }
+  events_close (events);
+}
+
+static void
+events_hook_conflict (struct satch *solver, struct clause *conflict)
+{
+  struct events *events = &solver->events;
+  if (!events->file)
+    return;
+
+  events_open (events, "conflict");
+  events_key (events, "clause_id");
+  events_number (events, conflict->id);
+  events_key (events, "literals");
+  events_clause (events, conflict);
+  events_key (events, "level");
+  events_number (events, solver->level);
+  events_key (events, "trail");
+  events_trail (events);
+  events_close (events);
+}
+
+#ifndef NCDCL
+
+// Fired before the unwind, while the learned clause is still the temporary
+// one in 'solver->clause'.  Its identifier is the next one 'add_clause'
+// will hand out, which an assertion after the allocation confirms.
+
+static void
+events_hook_learn (struct satch *solver, unsigned glue, unsigned jump_level)
+{
+  struct events *events = &solver->events;
+  if (!events->file)
+    return;
+
+  const size_t size = SIZE_STACK (solver->clause);
+
+  events_open (events, "learn");
+  events_key (events, "learned_literals");
+  events_char (events, '[');
+  bool first = true;
+  for (all_elements_on_stack (unsigned, lit, solver->clause))
+    {
+      if (!first)
+	events_char (events, ',');
+      first = false;
+      events_number (events, (int) export_literal (lit));
+    }
+  events_char (events, ']');
+  events_key (events, "glue");
+  events_number (events, glue);
+  events_key (events, "clause_id");
+  events_number (events,
+		 size == 1 ? -1 : (int64_t) (solver->statistics.added + 1));
+  events_key (events, "jump_level");
+  events_number (events, jump_level);
+  events_close (events);
+}
+
+#endif
+
+static void
+events_hook_backtrack (struct satch *solver, unsigned new_level)
+{
+  struct events *events = &solver->events;
+  if (!events->file)
+    return;
+
+  if (events->started)
+    {
+      events_open (events, "backtrack");
+      events_key (events, "from_level");
+      events_number (events, solver->level);
+      events_key (events, "to_level");
+      events_number (events, new_level);
+      events_key (events, "kind");
+      events_text (events, events_kind_string (events->kind));
+      events_key (events, "reason");
+      events_text (events, events->reason);
+      events_close (events);
+    }
+
+  events_trail_keep (events, new_level);
+  events->kind = EVENTS_KIND_OTHER;
+  events->reason = "other";
+}
+
+#ifndef NRESTART
+
+static void
+events_hook_restart (struct satch *solver)
+{
+  struct events *events = &solver->events;
+  if (!events->file)
+    return;
+
+  events_open (events, "restart");
+  events_key (events, "count");
+  events_number (events, solver->statistics.restarts);
+  events_close (events);
+}
+
+#endif
+
+static void
+events_hook_delete_clause (struct satch *solver, struct clause *c)
+{
+  struct events *events = &solver->events;
+  if (!events->file || !events->started)
+    return;
+
+  events_open (events, "delete_clause");
+  events_key (events, "clause_id");
+  events_number (events, c->id);
+  events_key (events, "literals");
+  events_clause (events, c);
+  events_close (events);
+}
+
+static void
+events_hook_inspect (struct satch *solver, struct clause *c,
+		     enum events_outcome outcome, unsigned watched,
+		     unsigned other, unsigned replacement)
+{
+  struct events *events = &solver->events;
+  if (!events->file || events->level < 2)
+    return;
+
+  events_open (events, "inspect");
+  events_key (events, "clause_id");
+  events_number (events, c->id);
+  events_key (events, "outcome");
+  events_text (events, events_outcome_string (outcome));
+  events_key (events, "watched");
+  events_char (events, '[');
+  events_number (events, (int) export_literal (watched));
+  events_char (events, ',');
+  events_number (events, (int) export_literal (other));
+  events_char (events, ']');
+  if (replacement != INVALID)
+    {
+      events_key (events, "next_watched");
+      events_char (events, '[');
+      events_number (events, (int) export_literal (other));
+      events_char (events, ',');
+      events_number (events, (int) export_literal (replacement));
+      events_char (events, ']');
+    }
+  events_close (events);
+}
+
+static void
+events_hook_result (struct satch *solver, int res)
+{
+  struct events *events = &solver->events;
+  if (!events->file)
+    return;
+
+  events_open (events, "result");
+  events_key (events, "result");
+  events_text (events, res == 10 ? "sat" : res == 20 ? "unsat" : "unknown");
+  events_key (events, "model");
+  if (res == 10)
+    events_trail (events);
+  else
+    events_string (events, "[]");
+  events_close (events);
+
+  events_flush (events);
+  events->file = 0;
+}
+
+#else
+
+#define BACKTRACK(SOLVER,LEVEL,KIND,REASON) backtrack ((SOLVER), (LEVEL))
+
+#endif
 
 /*------------------------------------------------------------------------*/
 
@@ -2246,7 +2566,7 @@ add_clause (struct satch *solver, bool redundant, unsigned glue)
 add_clause (struct satch *solver, bool redundant)
 #endif
 {
-#if defined(LOGGING) || defined(NRADIXSORT)
+#if defined(LOGGING) || defined(NRADIXSORT) || defined(EVENTS)
   const uint64_t added =
 #endif
     INC (added);
@@ -2257,7 +2577,7 @@ add_clause (struct satch *solver, bool redundant)
   assert (size > 2);		// No binary clauses allocated at all!
 #endif
   struct clause *res = allocate_clause (size);
-#if defined(LOGGING) || defined(NRADIXSORT)
+#if defined(LOGGING) || defined(NRADIXSORT) || defined(EVENTS)
   res->id = added;
 #endif
   res->garbage = false;
@@ -2333,6 +2653,9 @@ static size_t
 delete_clause (struct satch *solver, struct clause *c)
 {
   INC (deleted);
+#ifdef EVENTS
+  events_hook_delete_clause (solver, c);
+#endif
   LOGCLS (c, "delete");
   if (!c->garbage)
     {
@@ -3556,6 +3879,10 @@ assign (struct satch *solver, unsigned lit, struct clause *reason,
       assert (!reason->garbage);
 #endif
 
+#ifdef EVENTS
+  struct clause *const events_reason = reason;
+  const bool events_decision = !reason && solver->level && !known_unit;
+#endif
   const unsigned idx = INDEX (lit);
   const unsigned level =
     known_unit ? 0 : assignement_level (solver, lit, reason);
@@ -3644,6 +3971,14 @@ assign (struct satch *solver, unsigned lit, struct clause *reason,
 
 #ifndef NCONTROL
   assert (solver->level == SIZE_STACK (solver->control));
+#endif
+
+#ifdef EVENTS
+  events_hook_assign (solver, lit, level,
+#ifdef NCDCL
+		      events_reason == DUMMY_REASON ? 0 :
+#endif
+		      events_reason, events_decision);
 #endif
 }
 
@@ -4363,6 +4698,10 @@ propagate_literal (struct satch *solver, unsigned lit,
 #ifndef NBLOCK
 	      q[-2].header.blocking = other;
 #endif
+#ifdef EVENTS
+	      events_hook_inspect (solver, clause, EVENTS_SATISFIED,
+				   not_lit, other, INVALID);
+#endif
 	      continue;
 	    }
 
@@ -4424,9 +4763,17 @@ propagate_literal (struct satch *solver, unsigned lit,
 
 	      q[-2].header.blocking = replacement;
 #endif
+#ifdef EVENTS
+	      events_hook_inspect (solver, clause, EVENTS_SATISFIED,
+				   not_lit, other, INVALID);
+#endif
 	    }
 	  else if (!replacement_value)	// Replacement literal unassigned.
 	    {
+#ifdef EVENTS
+	      events_hook_inspect (solver, clause, EVENTS_UNRESOLVED,
+				   not_lit, other, replacement);
+#endif
 	      // First log the untouched clause, then stop watching the
 	      // originally watched literal by simply decreasing 'q'.
 
@@ -4457,6 +4804,10 @@ propagate_literal (struct satch *solver, unsigned lit,
 
 	      assert (other_value < 0);
 	      LOGCLS (clause, "conflicting");
+#ifdef EVENTS
+	      events_hook_inspect (solver, clause, EVENTS_FALSIFIED,
+				   not_lit, other, INVALID);
+#endif
 	      conflict = clause;
 	    }
 	  else
@@ -4465,6 +4816,10 @@ propagate_literal (struct satch *solver, unsigned lit,
 	      // and thus it is now assigned with this clause as reason.
 
 	      assert (!other_value);
+#ifdef EVENTS
+	      events_hook_inspect (solver, clause, EVENTS_UNIT,
+				   not_lit, other, INVALID);
+#endif
 	      assign (solver, other, clause, false);
 	      ticks++;
 	    }
@@ -4772,6 +5127,9 @@ backtrack (struct satch *solver, unsigned new_level)
 {
   LOG ("backtracking to level %u", new_level);
   assert (new_level < solver->level);
+#ifdef EVENTS
+  events_hook_backtrack (solver, new_level);
+#endif
 #if !defined(NDEBUG) || !defined(NCHRONO) || defined(NCONTROL)
   const unsigned *levels = solver->levels;
 #endif
@@ -4977,7 +5335,7 @@ update_phases_and_backtrack_to_root_level (struct satch *solver)
   if (solver->stable)
     update_phases (solver);
 #endif
-  backtrack (solver, 0);
+  BACKTRACK (solver, 0, EVENTS_KIND_OTHER, "simplify");
 
 #ifndef NCHRONO
   const struct clause *conflict = boolean_constraint_propagation (solver);
@@ -6061,6 +6419,10 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
   assert (!solver->inconsistent);
   assert (EMPTY_STACK (solver->clause));	// Clause learned.
 
+#ifdef EVENTS
+  events_hook_conflict (solver, conflict);
+#endif
+
   if (!solver->level)
     {
       LOG ("learned empty clause");
@@ -6093,7 +6455,7 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
     update_phases (solver);
 #endif
   unsigned not_uip = NOT (uip);
-  backtrack (solver, solver->level - 1);
+  BACKTRACK (solver, solver->level - 1, EVENTS_KIND_CONFLICT, "analyze");
   LOG ("swapping last decision %s", LOGLIT (uip));
   assert (!solver->values[uip]);
   assign (solver, not_uip, DUMMY_REASON, solver->level == 0);
@@ -6125,7 +6487,7 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
 #endif
       LOG ("missed propagation of lit %s from level %d", LOGLIT (*forcedp),
 	   conflict_level);
-      backtrack (solver, conflict_level - 1);
+      BACKTRACK (solver, conflict_level - 1, EVENTS_KIND_CONFLICT, "chrono");
 #ifndef NBLOCK
       if (is_temporary_binary (solver, conflict) || conflict->size == 2)
 	{
@@ -6150,7 +6512,7 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
     {
       LOG ("conflict was on level %d instead of current level %d",
 	   conflict_level, solver->level);
-      backtrack (solver, conflict_level);
+      BACKTRACK (solver, conflict_level, EVENTS_KIND_CONFLICT, "chrono");
     }
   else
     {
@@ -6281,6 +6643,13 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
     determine_jump_level (solver, conflict_level, &asserting_level);
   CLEAR_STACK (solver->blocks);
 
+#if defined(EVENTS) && !defined(NDEBUG)
+  const uint64_t events_learned_id = solver->statistics.added + 1;
+#endif
+#ifdef EVENTS
+  events_hook_learn (solver, glue, asserting_level);
+#endif
+
   {
     struct averages *a = averages (solver);
 #ifndef NRESTART
@@ -6357,12 +6726,12 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
 
 #ifndef NTARGET
   assert (solver->level);
-  backtrack (solver, solver->level - 1);
+  BACKTRACK (solver, solver->level - 1, EVENTS_KIND_CONFLICT, "analyze");
   if (solver->stable)
     update_phases (solver);
   if (jump_level < solver->level)
 #endif
-    backtrack (solver, jump_level);
+    BACKTRACK (solver, jump_level, EVENTS_KIND_CONFLICT, "analyze");
 
   if (size == 1)		// Learned a unit clause.
     {
@@ -6412,6 +6781,9 @@ analyze_conflict (struct satch *solver, struct clause *conflict)
       struct clause *learned = new_redundant_clause (solver, glue);
 #else
       struct clause *learned = new_redundant_clause (solver);
+#endif
+#if defined(EVENTS) && !defined(NDEBUG)
+      assert (!solver->events.file || learned->id == events_learned_id);
 #endif
 
 #ifndef NUSED
@@ -7205,6 +7577,9 @@ static void
 restart (struct satch *solver)
 {
   const uint64_t restarts = INC (restarts);
+#ifdef EVENTS
+  events_hook_restart (solver);
+#endif
   message (solver, 4, "restart", restarts,
 	   "restarting after %" PRIu64 " conflicts (limit %" PRIu64 ")",
 	   CONFLICTS, solver->limits.restart);
@@ -7219,10 +7594,10 @@ restart (struct satch *solver)
   {
     unsigned new_level = reuse_trail (solver);
     if (new_level < solver->level)
-      backtrack (solver, new_level);
+      BACKTRACK (solver, new_level, EVENTS_KIND_RESTART, "restart");
   }
 #else
-  backtrack (solver, 0);
+  BACKTRACK (solver, 0, EVENTS_KIND_RESTART, "restart");
 #endif
 
   uint64_t interval;
@@ -8174,7 +8549,7 @@ switch_mode (struct satch *solver)
   // literals are not all on the binary heap when switching back etc.
 
   if (solver->level)
-    backtrack (solver, 0);
+    BACKTRACK (solver, 0, EVENTS_KIND_OTHER, "switch");
 
   if (solver->stable)
     switch_to_focused_mode (solver, switched);
@@ -10343,7 +10718,7 @@ vivify_learn (struct satch *solver,
     {
       LOG ("size 1 learned unit clause forces jump level 0");
       if (solver->level)
-	backtrack (solver, 0);
+	BACKTRACK (solver, 0, EVENTS_KIND_OTHER, "vivify");
 
       const unsigned unit = ACCESS (solver->clause, 0);
       assign (solver, unit, 0, true);
@@ -10427,7 +10802,7 @@ vivify_learn (struct satch *solver,
 	  LOG ("determined jump level %u", jump_level);
 
 	  if (jump_level < solver->level)
-	    backtrack (solver, jump_level);
+	    BACKTRACK (solver, jump_level, EVENTS_KIND_OTHER, "vivify");
 	}
 
 #ifndef NVIRTUAL
@@ -10835,7 +11210,7 @@ vivify_clause (struct satch *solver, struct clause *c, unsigned *counts)
       const unsigned level = levels[INDEX (unit)];
       assert (level > 0);
       LOG ("forced to backtrack to level %u", level - 1);
-      backtrack (solver, level - 1);
+      BACKTRACK (solver, level - 1, EVENTS_KIND_OTHER, "vivify");
     }
 
   vivify_sort_stack_by_counts (solver, counts, sorted);
@@ -10863,7 +11238,7 @@ vivify_clause (struct satch *solver, struct clause *c, unsigned *counts)
 	    }
 
 	  LOG ("forced to backtrack to decision level %u", level - 1);
-	  backtrack (solver, level - 1);
+	  BACKTRACK (solver, level - 1, EVENTS_KIND_OTHER, "vivify");
 	}
       const char value = solver->values[lit];
       assert (!value || levels[INDEX (lit)] <= level);
@@ -10927,7 +11302,7 @@ vivify_clause (struct satch *solver, struct clause *c, unsigned *counts)
       const bool subsumed =
 	vivify_analyze (solver, c, conflict, &irredundant);
 
-      backtrack (solver, solver->level - 1);
+      BACKTRACK (solver, solver->level - 1, EVENTS_KIND_OTHER, "vivify");
 
       if (subsumed)
 	{
@@ -11367,7 +11742,7 @@ vivify_round (struct satch *solver, unsigned round, uint64_t delta,
     }
 
   if (solver->level)
-    backtrack (solver, 0);
+    BACKTRACK (solver, 0, EVENTS_KIND_OTHER, "vivify");
   if (!solver->inconsistent)
     {
       size_t remain = SIZE_STACK (*schedule);
@@ -11654,6 +12029,9 @@ solve (struct satch *solver, int delta_limit)
 {
   START (solve);
   report (solver, 1, '*');
+#ifdef EVENTS
+  events_hook_init (solver);
+#endif
 
   int res = solver->inconsistent ? 20 : 0;
   struct clause *conflict;
@@ -11852,7 +12230,7 @@ internal_release (struct satch *solver)
 {
 #ifdef NLEARN
   if (solver->level)
-    backtrack (solver, 0);	// To delete reason clauses.
+    BACKTRACK (solver, 0, EVENTS_KIND_OTHER, "release");
 #endif
 
   solver->proof = 0;
@@ -11871,6 +12249,9 @@ internal_release (struct satch *solver)
     }
 
   free (solver->watches);
+#ifdef EVENTS
+  events_release (&solver->events);
+#endif
 
   free (solver->levels);
   free (solver->values);
@@ -12309,6 +12690,9 @@ satch_solve (struct satch *solver, int conflict_limit)
       check_witness (solver);
 #endif
     }
+#ifdef EVENTS
+  events_hook_result (solver, res);
+#endif
   return res;
 }
 
@@ -12353,6 +12737,21 @@ satch_trace_proof (struct satch *solver, FILE * proof)
 {
   REQUIRE_NON_ZERO_SOLVER ();
   solver->proof = proof;
+}
+
+void
+satch_events (struct satch *solver, FILE * file, int level)
+{
+  REQUIRE_NON_ZERO_SOLVER ();
+#ifdef EVENTS
+  solver->events.file = file;
+  solver->events.level = level;
+  solver->events.kind = EVENTS_KIND_OTHER;
+  solver->events.reason = "other";
+#else
+  (void) file, (void) level;
+  invalid_usage ("solver not configured with '--events'", __func__);
+#endif
 }
 
 /*------------------------------------------------------------------------*/

@@ -1,6 +1,8 @@
 *.o
 *.a
 satch
+satch-cdcl
+satch-dpll
 testapi
 gencombi
 makefile

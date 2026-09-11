@@ -33,6 +33,11 @@ static const char *usage =
 "  -q | --quiet         disable verbose messages\n"
 "  -v | --verbose       increment verbose level\n"
 "\n"
+#ifdef EVENTS
+"  --events=<file>      write a solver event protocol log to <file>\n"
+"  --events-level=<n>   1 for search events, 2 adds BCP inspections\n"
+"\n"
+#endif
 "or one of these long options setting limits\n"
 "\n"
 "  --conflicts=<limit>\n"
@@ -133,6 +138,14 @@ static const char *quiet;	// Turn off default 'verbose' mode.
 const char *no_witness;		// Do not print satisfying assignment.
 
 static int verbose = 1;		// Verbose level (unless 'quiet' is set).
+
+#ifdef EVENTS
+static const char *events_option;	// Option string of '--events'.
+static const char *events_path;		// Event log file to write.
+static const char *events_level_option;	// Option string of '--events-level'.
+static int events_level = 1;		// Level '2' adds BCP inspections.
+static FILE *events_file;
+#endif
 
 /*------------------------------------------------------------------------*/
 
@@ -1122,6 +1135,22 @@ main (int argc, char **argv)
 	set_option (&quiet, arg);
       else if (!strcmp (arg, "-v") || !strcmp (arg, "--verbose"))
 	verbose += (verbose < INT_MAX);
+#ifdef EVENTS
+      else if (!strncmp (arg, "--events=", 9))
+	{
+	  set_option (&events_option, arg);
+	  events_path = arg + 9;
+	  if (!*events_path)
+	    error ("missing file in '%s'", arg);
+	}
+      else if (parse_int_option (arg, "events-level",
+				 &events_level_option, &events_level))
+	{
+	  if (events_level < 1 || events_level > 2)
+	    error ("event log level '%d' in '%s' is not 1 or 2",
+		   events_level, arg);
+	}
+#endif
       else if (parse_int_option (arg, "conflicts",
 				 &conflict_option, &conflict_limit))
 	{
@@ -1213,6 +1242,17 @@ main (int argc, char **argv)
       satch_trace_proof (solver, proof.file);
     }
 
+#ifdef EVENTS
+  if (events_level_option && !events_path)
+    error ("invalid '--events-level' without '--events=<file>'");
+  if (events_path)
+    {
+      if (!(events_file = fopen (events_path, "w")))
+	error ("can not write event log file '%s'", events_path);
+      satch_events (solver, events_file, events_level);
+    }
+#endif
+
   parse ();
 
   if (conflict_option && !quiet)
@@ -1222,6 +1262,11 @@ main (int argc, char **argv)
     }
 
   int res = satch_solve (solver, conflict_limit);
+
+#ifdef EVENTS
+  if (events_file)
+    fclose (events_file);
+#endif
 
   if (proof.file)
     {

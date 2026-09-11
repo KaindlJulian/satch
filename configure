@@ -11,6 +11,7 @@ where '<option>' is one of the following:
                        
 -c | --check            include internal checking code (forced by '-g')
 -l | --logging          include internal logging code (forced by '-g')
+-e | --events           include solver event protocol code (needs '--no-block')
 -s | --symbols          include symbol table (forced by '-g' useful without)
 -p | --pedantic         pedantic compilation ('-Werror -std=c99 --pedantic')
 -d | --diagnose         print compiler options (compiler pragma messages)
@@ -50,6 +51,7 @@ die () {
 debug=no
 check=undefined
 logging=undefined
+events=no
 symbols=no
 pedantic=no
 diagnose=no
@@ -80,6 +82,7 @@ do
     -g|--debug) debug=yes;;
     -c|--check) check=yes;;
     -l|--logging) logging=yes;;
+    -e|--events) events=yes;;
     -s|--symbols) symbols=yes;;
     -p|--pedantic) pedantic=yes;;
     -d|--diagnose) diagnose=yes;;
@@ -156,6 +159,7 @@ CFLAGS="$CFLAGS$options"
 
 [ $check = no ] && CFLAGS="$CFLAGS -DNDEBUG"
 [ $logging = yes ] && CFLAGS="$CFLAGS -DLOGGING"
+[ $events = yes ] && CFLAGS="$CFLAGS -DEVENTS"
 [ $diagnose = yes ] && CFLAGS="$CFLAGS -DIAGNOSE"
 
 . features/define.sh
