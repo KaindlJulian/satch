@@ -13,7 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define EVENTS_PROTOCOL_VERSION "3"
+#define EVENTS_PROTOCOL_VERSION "1"
 #define EVENTS_FLUSH_BYTES (1u << 18)
 
 enum events_kind
